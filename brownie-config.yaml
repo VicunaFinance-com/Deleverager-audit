@@ -1,0 +1,27 @@
+dependencies:
+  - OpenZeppelin/openzeppelin-contracts@4.8.0
+  
+project_structure:
+    build: build
+    contracts: contracts
+    interfaces: contracts/interfaces
+    reports: reports
+    scripts: scripts
+    tests: tests
+
+dev_deployment_artifacts: true
+
+networks:
+    networks:
+        development:
+            explorer: "https://sonic.drpc.org"
+    default: development
+compiler:
+    solc:
+        version: 0.8.10
+        optimizer:
+            enabled: true
+            runs: 999
+        remappings:
+           - "@openzeppelin=OpenZeppelin/openzeppelin-contracts@4.8.0"
+dotenv: .env
