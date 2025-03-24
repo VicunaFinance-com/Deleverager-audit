@@ -56,7 +56,6 @@ interface IAaveOracle is IPriceOracleGetter {
    */
   function getAssetsPrices(address[] calldata assets) external view returns (uint256[] memory);
 
-  function getAssetPrice(address asset) external view returns (uint256);
   /**
    * @notice Returns the address of the source for an asset address
    * @param asset The address of the asset

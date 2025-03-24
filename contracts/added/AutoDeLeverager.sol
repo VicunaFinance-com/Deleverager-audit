@@ -7,18 +7,20 @@ import {SafeERC20} from "../dependencies/openzeppelin/contracts/SafeERC20.sol";
 import {IPyth, Price} from "../interfaces/IPyth.sol";
 import {Ownable} from "../dependencies/openzeppelin/contracts/Ownable.sol";
 import {DataTypes} from "../protocol/libraries/types/DataTypes.sol";
-import {IPeggedOracle} from "../interfaces/IPeggedOracle.sol";
 import {IICHIVault} from "../interfaces/IICHIVault.sol";
 import {IPool} from "../interfaces/IPool.sol";
 import {IBeefyVault} from "../interfaces/IBeefyVault.sol";
-import {IPoolDataProvider} from "../interfaces/IPoolDataProvider.sol";
 import {ReserveConfiguration} from "../protocol/libraries/configuration/ReserveConfiguration.sol";
 import {UserConfiguration} from "../protocol/libraries/configuration/UserConfiguration.sol";
 import {IAaveOracle} from "../interfaces/IAaveOracle.sol";
+import {IBeetsPool} from "../interfaces/IBeetsPool.sol";
+import {IBeetsVaultOracle} from "../interfaces/IBeetsVaultOracle.sol";
 
 import {Pausable} from "../dependencies/openzeppelin/contracts/Pausable.sol";
 
 import {IAToken} from "../interfaces/IAToken.sol";
+
+import {IBalancerVault} from "../interfaces/IBalancerVault.sol";
 
 /**
  * @title Autoleverager
@@ -30,6 +32,12 @@ contract AutoDeLeverager is Ownable, Pausable {
     using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
     using UserConfiguration for DataTypes.UserConfigurationMap;
     using SafeERC20 for IERC20;
+
+    enum TokenType {
+        CLASSIC,
+        ICHI,
+        BEETS
+    }
 
     /// @notice Router used for token swaps
     address public odosRouter;
@@ -46,9 +54,13 @@ contract AutoDeLeverager is Ownable, Pausable {
     /// @notice Pool used for flash loans
     IPool public borrowPool;
 
+    IBalancerVault public beetsVault;
+
     IAaveOracle public oracle;
 
     address[] public supportedAssets;
+    mapping(address => TokenType) public tokenToType;
+
     uint256 public MAX_PRICE_IMPACT;
 
     /// @notice Emitted when a leveraged deposit is completed
@@ -70,7 +82,8 @@ contract AutoDeLeverager is Ownable, Pausable {
     /// @notice Emitted when tokens are rescued in an emergency
     event TokensRescued(address indexed token, address indexed recipient, uint256 amount);
 
-    event ValueOfTokenInContract(uint256 value);
+    // event ValueOfTokenInContract(uint256 value);
+    event LogUint(uint256 value);
 
     /**
      * @notice Constructor to initialize the Autoleverager contract
@@ -84,6 +97,7 @@ contract AutoDeLeverager is Ownable, Pausable {
         address _pool,
         address _borrowPool,
         address _feeReceiver,
+        address _beetsVault,
         address _oracle
     ) {
         odosRouter = _odosRouter;
@@ -91,6 +105,7 @@ contract AutoDeLeverager is Ownable, Pausable {
         borrowPool = IPool(_borrowPool);
         feeReceiver = _feeReceiver;
         oracle = IAaveOracle(_oracle);
+        beetsVault = IBalancerVault(_beetsVault);
     }
 
     /**
@@ -104,8 +119,13 @@ contract AutoDeLeverager is Ownable, Pausable {
         emit FeeUpdated(oldFee, _fee);
     }
 
-    function addSupportedAsset(address asset) external onlyOwner {
+    function addSupportedAsset(address asset, TokenType tokenType) external onlyOwner {
         supportedAssets.push(asset);
+        tokenToType[asset] = tokenType;
+    }
+
+    function setTokenType(address asset, TokenType tokenType) external onlyOwner {
+        tokenToType[asset] = tokenType;
     }
 
     function removeSupportedAsset(address asset) external onlyOwner {
@@ -215,6 +235,7 @@ contract AutoDeLeverager is Ownable, Pausable {
         address sender;
         address withdrawAsset;
         TokenAmount[] initialBalances;
+        uint256 initialValueOfAssets;
     }
 
     struct inputWithdrawData {
@@ -280,6 +301,12 @@ contract AutoDeLeverager is Ownable, Pausable {
         return totalValue;
     }
 
+    function _computeValueOfAsset(address asset, uint256 amount) internal view returns (uint256) {
+        uint8 tokenDecimals = getDecimals(asset);
+        uint256 tokenPrice = oracle.getAssetPrice(asset);
+        return (convertDecimals(amount, tokenDecimals, 18) * tokenPrice) / 1e18;
+    }
+
     /**
      * @notice Creates a leveraged position using flash loans
      */
@@ -287,29 +314,26 @@ contract AutoDeLeverager is Ownable, Pausable {
         WithdrawData memory withdrawParams;
         withdrawParams.sender = msg.sender;
         withdrawParams.inputData = inputParameters;
+        withdrawParams.initialValueOfAssets = _checkValueOfSupportedAssetInContract();
+        emit LogUint(withdrawParams.initialValueOfAssets);
 
         withdrawParams.withdrawAsset = IAToken(inputParameters.withdrawAssetAToken)
             .UNDERLYING_ASSET_ADDRESS();
 
-        bool isSimpleToken;
+        TokenType tokenType = tokenToType[address(inputParameters.vicunaVault)];
         IBeefyVault beefyVault = IBeefyVault(inputParameters.vicunaVault);
-        try beefyVault.want() returns (address) {
-            isSimpleToken = false;
-        } catch Error(string memory) {
-            isSimpleToken = true;
-        }
-        withdrawParams.initialBalances = new TokenAmount[](isSimpleToken ? 2 : 3);
+        withdrawParams.initialBalances = new TokenAmount[](tokenType == TokenType.CLASSIC ? 2 : 3);
         withdrawParams.initialBalances[0] = TokenAmount(
             IERC20(inputParameters.borrowAsset),
             IERC20(inputParameters.borrowAsset).balanceOf(address(this))
         );
 
-        if (isSimpleToken) {
+        if (tokenType == TokenType.CLASSIC) {
             withdrawParams.initialBalances[1] = TokenAmount(
                 IERC20(withdrawParams.withdrawAsset),
                 IERC20(withdrawParams.withdrawAsset).balanceOf(address(this))
             );
-        } else {
+        } else if (tokenType == TokenType.ICHI) {
             IICHIVault ichiVault = IICHIVault(beefyVault.want());
 
             if (inputParameters.borrowAsset != ichiVault.token0()) {
@@ -324,6 +348,21 @@ contract AutoDeLeverager is Ownable, Pausable {
                     IERC20(ichiVault.token1()).balanceOf(address(this))
                 );
             }
+        } else if (tokenType == TokenType.BEETS) {
+            IBeetsVaultOracle beetsOracle = IBeetsVaultOracle(
+                oracle.getSourceOfAsset(address(beefyVault))
+            );
+
+            (, address[] memory tokens) = beetsOracle.getTotalTokensInPool();
+            uint256 tokensLength = tokens.length;
+            for (uint256 idx = 0; idx < tokensLength; idx++) {
+                if (inputParameters.borrowAsset != tokens[idx]) {
+                    withdrawParams.initialBalances[1 + idx] = TokenAmount(
+                        IERC20(tokens[idx]),
+                        IERC20(tokens[idx]).balanceOf(address(this))
+                    );
+                }
+            }
         }
 
         bytes memory params = abi.encode(withdrawParams);
@@ -336,6 +375,40 @@ contract AutoDeLeverager is Ownable, Pausable {
         uint256[] memory modes = new uint256[](1);
         modes[0] = 0;
         borrowPool.flashLoan(address(this), assets, amounts, modes, address(this), params, 0);
+    }
+
+    function _ichiWithdraw(address vicunaVault) internal {
+        IBeefyVault beefyVault = IBeefyVault(vicunaVault);
+        IICHIVault ichiVault = IICHIVault(beefyVault.want());
+        uint256 beforeWithdraw = IERC20(address(ichiVault)).balanceOf(address(this));
+        beefyVault.withdrawAll();
+        uint256 ichiAmount = IERC20(address(ichiVault)).balanceOf(address(this)) - beforeWithdraw;
+
+        // Withdraw from ICHI vault
+        IICHIVault(ichiVault).withdraw(ichiAmount, address(this));
+    }
+
+    function _beetsWithdraw(address vicunaVault) internal {
+        IBeefyVault beefyVault = IBeefyVault(vicunaVault);
+        IBeetsPool beetsPool = IBeetsPool(beefyVault.want());
+        uint256 beforeWithdraw = IERC20(address(beetsPool)).balanceOf(address(this));
+        beefyVault.withdrawAll();
+
+        uint256 withdrawAmount = IERC20(address(beetsPool)).balanceOf(address(this)) -
+            beforeWithdraw;
+        (address[] memory tokens, , ) = beetsVault.getPoolTokens(beetsPool.getPoolId());
+        uint256[] memory minAmountsOut = new uint256[](tokens.length); // slippage protected by MAX_PRICE_IMPACT
+
+        IERC20(address(beetsPool)).approve(address(beetsVault), withdrawAmount);
+        bytes memory userData = abi.encode(2, withdrawAmount); // EXACT_BPT_IN_FOR_ALL_TOKENS_OUT
+
+        IBalancerVault.ExitPoolRequest memory exitPoolRequest = IBalancerVault.ExitPoolRequest(
+            tokens,
+            minAmountsOut,
+            userData,
+            false
+        );
+        beetsVault.exitPool(beetsPool.getPoolId(), address(this), address(this), exitPoolRequest);
     }
 
     /**
@@ -374,41 +447,56 @@ contract AutoDeLeverager is Ownable, Pausable {
             address(this)
         );
 
-        // Withdraw from Beefy vault
-        bool isSimpleToken;
-        IBeefyVault beefyVault = IBeefyVault(withdrawData.inputData.vicunaVault);
-        try beefyVault.want() returns (address) {
-            isSimpleToken = false;
-        } catch Error(string memory) {
-            isSimpleToken = true;
-        }
-        if (!isSimpleToken) {
-            IICHIVault ichiVault = IICHIVault(beefyVault.want());
-            uint256 beforeWithdraw = IERC20(address(ichiVault)).balanceOf(address(this));
-            beefyVault.withdrawAll();
-            uint256 ichiAmount = IERC20(address(ichiVault)).balanceOf(address(this)) -
-                beforeWithdraw;
-
-            // Withdraw from ICHI vault
-            IICHIVault(ichiVault).withdraw(ichiAmount, address(this));
+        TokenType tokenType = tokenToType[withdrawData.inputData.vicunaVault];
+        uint256 lpValue = _computeValueOfAsset(
+            withdrawData.withdrawAsset,
+            IERC20(withdrawData.withdrawAsset).balanceOf(address(this))
+        );
+        emit LogUint(lpValue);
+        if (tokenType == TokenType.ICHI) {
+            _ichiWithdraw(withdrawData.inputData.vicunaVault);
         }
 
+        if (tokenType == TokenType.BEETS) {
+            _beetsWithdraw(withdrawData.inputData.vicunaVault);
+        }
+        {
+            uint256 contractValue = _checkValueOfSupportedAssetInContract() -
+                withdrawData.initialValueOfAssets;
+            emit LogUint(contractValue);
+            require(
+                contractValue >= lpValue ||
+                    lpValue - contractValue <= (lpValue * MAX_PRICE_IMPACT) / 10000,
+                "Withdrawal Price impact too high"
+            );
+        }
         // Swap to borrow asset
         if (withdrawData.inputData.swapParams.length > 0) {
-            if (isSimpleToken) {
+            if (tokenType == TokenType.CLASSIC) {
                 IERC20(withdrawData.withdrawAsset).approve(odosRouter, type(uint256).max);
-            } else {
+            } else if (tokenType == TokenType.ICHI) {
+                IBeefyVault beefyVault = IBeefyVault(withdrawData.inputData.vicunaVault);
                 IICHIVault ichiVault = IICHIVault(beefyVault.want());
                 IERC20(ichiVault.token0()).approve(odosRouter, type(uint256).max);
                 IERC20(ichiVault.token1()).approve(odosRouter, type(uint256).max);
+            } else if (tokenType == TokenType.BEETS) {
+                IBeetsVaultOracle beetsOracle = IBeetsVaultOracle(
+                    oracle.getSourceOfAsset(withdrawData.inputData.vicunaVault)
+                );
+
+                (, address[] memory tokens) = beetsOracle.getTotalTokensInPool();
+                uint256 tokensLength = tokens.length;
+                for (uint256 idx = 0; idx < tokensLength; idx++) {
+                    IERC20(tokens[idx]).approve(odosRouter, type(uint256).max);
+                }
             }
             // Check value of assets received before swapping
             uint256 totalValueBeforeSwap = _checkValueOfSupportedAssetInContract();
-            emit ValueOfTokenInContract(totalValueBeforeSwap);
+            emit LogUint(totalValueBeforeSwap);
             (bool success, ) = odosRouter.call(withdrawData.inputData.swapParams);
             require(success, "Swap failed");
             uint256 totalValueAfterSwap = _checkValueOfSupportedAssetInContract();
-            emit ValueOfTokenInContract(totalValueAfterSwap);
+            emit LogUint(totalValueAfterSwap);
             require(
                 totalValueAfterSwap >= totalValueBeforeSwap ||
                     totalValueBeforeSwap - totalValueAfterSwap <=

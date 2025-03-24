@@ -30,5 +30,5 @@ interface IICHIVault {
     function allowToken0() external view returns(bool);
     function allowToken1() external view returns(bool);
     function deposit(uint256 amount0, uint256 amount1, address to) external returns(uint256 shares);
-    function withdraw(uint256 shares, address to) external returns(uint256 amount0, uint256 amount1);   
+    function withdraw(uint256 shares, address to) external returns(uint256 amount0, uint256 amount1);
 }
