@@ -1,0 +1,20 @@
+Metadata-Version: 2.2
+Name: py_vector
+Version: 0.0.1
+Author-email: Your Name <your.email@example.com>
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: requests
+Requires-Dist: eth-brownie
+Requires-Dist: pandas
+Requires-Dist: autopep8
+Requires-Dist: isort
+Requires-Dist: pyyaml
+Requires-Dist: beautifulsoup4
+Requires-Dist: omegaconf
+Requires-Dist: pydantic
+Requires-Dist: python-dotenv
+Requires-Dist: lxml
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"

@@ -1,0 +1,15 @@
+requests
+eth-brownie
+pandas
+autopep8
+isort
+pyyaml
+beautifulsoup4
+omegaconf
+pydantic
+python-dotenv
+lxml
+
+[dev]
+pytest
+black
