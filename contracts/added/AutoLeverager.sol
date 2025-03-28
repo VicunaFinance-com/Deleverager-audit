@@ -11,17 +11,20 @@ import {IICHIVault} from "../interfaces/IICHIVault.sol";
 import {IPool} from "../interfaces/IPool.sol";
 import {IBeefyVault} from "../interfaces/IBeefyVault.sol";
 
+import {Pausable} from "../dependencies/openzeppelin/contracts/Pausable.sol";
+
 /**
  * @title Autoleverager
- * @author Your Name
+ * @author Vicuna Finance
  * @notice This contract automates leveraged positions in AAVE markets using ICHI vaults and Beefy vaults
  * @dev Uses flash loans to achieve leverage and handles the complete flow of leverage deposit
  */
-contract AutoLeverager is Ownable {
+contract AutoLeverager is Ownable, Pausable {
     using SafeERC20 for IERC20;
 
     /// @notice Router used for token swaps
     address public odosRouter;
+    bytes4 public constant swapCompactSelector = 0x83bd37f9;
 
     /// @notice Address that receives fees
     address public feeReceiver;
@@ -34,6 +37,8 @@ contract AutoLeverager is Ownable {
 
     /// @notice Pool used for flash loans
     IPool public borrowPool;
+
+    uint256 public DENOMINATOR = 10000;
 
     /// @notice Emitted when a leveraged deposit is completed
     event LeverageDeposited(
@@ -53,7 +58,7 @@ contract AutoLeverager is Ownable {
 
     /// @notice Emitted when tokens are rescued in an emergency
     event TokensRescued(address indexed token, address indexed recipient, uint256 amount);
-
+    
     /**
      * @notice Constructor to initialize the Autoleverager contract
      * @param _odosRouter Address of the ODOS router for swaps
@@ -62,10 +67,10 @@ contract AutoLeverager is Ownable {
      * @param _feeReceiver Address that will receive fees
      */
     constructor(address _odosRouter, address _pool, address _borrowPool, address _feeReceiver) {
-        odosRouter = _odosRouter;
-        pool = IPool(_pool);
-        borrowPool = IPool(_borrowPool);
-        feeReceiver = _feeReceiver;
+        _setOdosRouter(_odosRouter);
+        setPool(_pool);
+        setBorrowPool(_borrowPool);
+        setFeeReceiver(_feeReceiver);
     }
 
     /**
@@ -73,17 +78,25 @@ contract AutoLeverager is Ownable {
      * @param _fee New fee percentage (10000 = 100%)
      */
     function setFee(uint256 _fee) external onlyOwner {
-        require(_fee <= 10000, "Fee too high");
+        require(_fee <= 500, "Fee too high");
         uint256 oldFee = fee;
         fee = _fee;
         emit FeeUpdated(oldFee, _fee);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /**
      * @notice Sets the ODOS router address
      * @param _odosRouter New router address
      */
-    function setOdosRouter(address _odosRouter) external onlyOwner {
+    function _setOdosRouter(address _odosRouter) internal {
         require(_odosRouter != address(0), "Invalid address");
         address oldRouter = odosRouter;
         odosRouter = _odosRouter;
@@ -94,7 +107,7 @@ contract AutoLeverager is Ownable {
      * @notice Sets the main pool address
      * @param _pool New pool address
      */
-    function setPool(address _pool) external onlyOwner {
+    function setPool(address _pool) public onlyOwner {
         require(_pool != address(0), "Invalid address");
         address oldPool = address(pool);
         pool = IPool(_pool);
@@ -105,7 +118,7 @@ contract AutoLeverager is Ownable {
      * @notice Sets the borrow pool address used for flash loans
      * @param _borrowPool New borrow pool address
      */
-    function setBorrowPool(address _borrowPool) external onlyOwner {
+    function setBorrowPool(address _borrowPool) public onlyOwner {
         require(_borrowPool != address(0), "Invalid address");
         address oldBorrowPool = address(borrowPool);
         borrowPool = IPool(_borrowPool);
@@ -116,7 +129,7 @@ contract AutoLeverager is Ownable {
      * @notice Sets the fee receiver address
      * @param _feeReceiver New fee receiver address
      */
-    function setFeeReceiver(address _feeReceiver) external onlyOwner {
+    function setFeeReceiver(address _feeReceiver) public onlyOwner {
         require(_feeReceiver != address(0), "Invalid address");
         address oldFeeReceiver = feeReceiver;
         feeReceiver = _feeReceiver;
@@ -134,26 +147,6 @@ contract AutoLeverager is Ownable {
         return abi.decode(data, (uint8));
     }
 
-    /**
-     * @notice Converts amount from one token's decimals to another
-     * @param amount Amount to convert
-     * @param fromDecimals Source token decimals
-     * @param toDecimals Target token decimals
-     * @return Converted amount
-     */
-    function convertDecimals(
-        uint256 amount,
-        uint8 fromDecimals,
-        uint8 toDecimals
-    ) internal pure returns (uint256) {
-        if (fromDecimals == toDecimals) {
-            return amount;
-        } else if (fromDecimals > toDecimals) {
-            return amount / (10 ** (fromDecimals - toDecimals));
-        } else {
-            return amount * (10 ** (toDecimals - fromDecimals));
-        }
-    }
 
     struct DepositData {
         InputDepositData inputData;
@@ -173,7 +166,7 @@ contract AutoLeverager is Ownable {
     /**
      * @notice Creates a leveraged position using flash loans
      */
-    function leverageDeposit(InputDepositData calldata inputParameters) external {
+    function leverageDeposit(InputDepositData calldata inputParameters) external whenNotPaused {
         DepositData memory depositParams;
         depositParams.sender = msg.sender;
         depositParams.inputData = inputParameters;
@@ -202,7 +195,7 @@ contract AutoLeverager is Ownable {
         );
 
         // Calculate and transfer fee
-        uint256 feeAmount = (inputParameters.initialAmount * fee) / 10000;
+        uint256 feeAmount = (inputParameters.initialAmount * fee) / DENOMINATOR;
         if (feeAmount > 0) {
             IERC20(inputParameters.depositAsset).safeTransfer(feeReceiver, feeAmount);
         }
@@ -268,24 +261,26 @@ contract AutoLeverager is Ownable {
         if (flashLoanAsset != vaultDepositAsset) {
             // Swap flash loaned asset to vault deposit asset
             // Approve the full amount needed for the swap
-            IERC20(flashLoanAsset).safeApprove(odosRouter, 0);
-            IERC20(flashLoanAsset).safeIncreaseAllowance(odosRouter, type(uint256).max);
+            bytes4 swapSelector = bytes4(depositData.inputData.swapParams);
+            require(swapSelector == swapCompactSelector, "Invalid swap selector");
+            IERC20(flashLoanAsset).safeApprove(odosRouter, type(uint256).max);
             uint256 beforeBalance = IERC20(vaultDepositAsset).balanceOf(address(this));
             // Execute the swap
             (bool success, ) = odosRouter.call(depositData.inputData.swapParams);
             require(success, "Swap failed");
+            IERC20(flashLoanAsset).safeApprove(odosRouter, 0);
             swapAmountoutput = IERC20(vaultDepositAsset).balanceOf(address(this)) - beforeBalance;
         } else if (
             flashLoanAsset == vaultDepositAsset &&
             depositData.inputData.depositAsset != vaultDepositAsset
         ) {
-            IERC20(depositData.inputData.depositAsset).safeIncreaseAllowance(
-                odosRouter,
-                depositData.initialAmountAfterFee
-            );
+            bytes4 swapSelector = bytes4(depositData.inputData.swapParams);
+            require(swapSelector == swapCompactSelector, "Invalid swap selector");
+            IERC20(depositData.inputData.depositAsset).safeApprove(odosRouter, type(uint256).max);
             uint256 beforeBalance = IERC20(vaultDepositAsset).balanceOf(address(this));
 
             (bool success, ) = odosRouter.call(depositData.inputData.swapParams);
+            IERC20(depositData.inputData.depositAsset).safeApprove(odosRouter, 0);
             require(success, "Swap failed");
             swapAmountoutput = IERC20(vaultDepositAsset).balanceOf(address(this)) - beforeBalance;
         }
@@ -294,34 +289,32 @@ contract AutoLeverager is Ownable {
         IICHIVault ichiVault = IICHIVault(IBeefyVault(depositData.inputData.vicunaVault).want());
         bool isToken0 = ichiVault.token0() == vaultDepositAsset;
         // Deposit into ICHI vault
-        IERC20(vaultDepositAsset).safeIncreaseAllowance(address(ichiVault), depositAmount);
-        IICHIVault(ichiVault).deposit(
+        IERC20(vaultDepositAsset).safeApprove(address(ichiVault), depositAmount);
+        uint256 ichiBalance = IICHIVault(ichiVault).deposit(
             isToken0 ? depositAmount : 0,
             isToken0 ? 0 : depositAmount,
             address(this)
         );
+        IERC20(vaultDepositAsset).safeApprove(address(ichiVault), 0);
+
 
         // Deposit ICHI LP tokens into Beefy vault
-        uint256 ichiBalance = IERC20(address(ichiVault)).balanceOf(address(this));
-        IERC20(address(ichiVault)).safeIncreaseAllowance(
-            depositData.inputData.vicunaVault,
-            ichiBalance
-        );
+        IERC20(address(ichiVault)).safeApprove(depositData.inputData.vicunaVault, ichiBalance);
         IBeefyVault(depositData.inputData.vicunaVault).deposit(ichiBalance);
+        IERC20(address(ichiVault)).safeApprove(depositData.inputData.vicunaVault, 0);
+
 
         // Supply Beefy vault tokens to Aave
         uint256 vaultBalance = IERC20(depositData.inputData.vicunaVault).balanceOf(address(this));
-        IERC20(depositData.inputData.vicunaVault).safeIncreaseAllowance(
-            address(pool),
-            vaultBalance
-        );
+        IERC20(depositData.inputData.vicunaVault).safeApprove(address(pool), vaultBalance);
         pool.supply(depositData.inputData.vicunaVault, vaultBalance, depositData.sender, 0);
+        IERC20(depositData.inputData.vicunaVault).safeApprove(address(pool), 0);
 
         // Borrow from Aave
         pool.borrow(depositData.inputData.borrowAsset, flashLoanAmount, 2, 0, depositData.sender);
 
         // Approve and repay flash loan
-        IERC20(flashLoanAsset).safeIncreaseAllowance(address(borrowPool), flashLoanAmount);
+        IERC20(flashLoanAsset).approve(address(borrowPool), flashLoanAmount);
         return true;
     }
 
@@ -339,23 +332,8 @@ contract AutoLeverager is Ownable {
         emit TokensRescued(token, to, amount);
     }
 
-    /**
-     * @notice Rescues ETH accidentally sent to the contract
-     * @param to Address to send the ETH to
-     * @param amount Amount of ETH to rescue
-     */
-    function rescueETH(address payable to, uint256 amount) external onlyOwner {
-        require(to != address(0), "Cannot send to zero address");
-        require(address(this).balance >= amount, "Insufficient ETH balance");
-
-        (bool success, ) = to.call{value: amount}("");
-        require(success, "ETH transfer failed");
-
-        emit TokensRescued(address(0), to, amount);
+    receive() external payable {
+        revert();
     }
 
-    /**
-     * @notice Allows the contract to receive ETH
-     */
-    receive() external payable {}
 }
